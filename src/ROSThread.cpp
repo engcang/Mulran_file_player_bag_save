@@ -700,85 +700,82 @@ ROSThread::ResetProcessStamp(int position)
 }
 
 
+void ROSThread::SaveRosbag() {
+    rosbag::Bag bag;
+    const std::string bag_path = data_folder_path_ + "/imu_lidar_output.bag";
+    bag.open(bag_path, rosbag::bagmode::Write);
+    std::cout << "Saving IMU and LiDAR data to: " << bag_path << std::endl;
 
-void ROSThread::SaveRosbag()
-{
-  rosbag::Bag bag;
-  const std::string bag_path = data_folder_path_+"/output.bag";
-  bag.open(data_folder_path_+"/output.bag", rosbag::bagmode::Write);
-  cout<<"Storing bag to: "<<bag_path<<endl;
+    const ros::Time min_time = ros::TIME_MIN;
+    const ros::Time max_time = ros::TIME_MAX;
 
+    // Save IMU data
+    for (const auto& imu_entry : imu_data_) {
+        const int64_t& stamp_ns = imu_entry.first;
+        ros::Time stamp = ros::Time().fromNSec(stamp_ns);
 
-  GetDirList(data_folder_path_ + "/sensor_data/radar/polar", radarpolar_file_list_);
-
-  int current_img_index = 0;
-  int previous_img_index = 0;
-
-
-  cout<<"Found: "<<radarpolar_file_list_.size()<<" radar sweeps"<<endl;
-  int count = 1;
-  for(auto && file_name : radarpolar_file_list_){
-
-    cv::Mat radarpolar_image;
-    const std::string file_path = data_folder_path_ + "/sensor_data/radar/polar/" + file_name;
-    cout<<"radar: "<<count++<<"/"<<radarpolar_file_list_.size()<<endl;
-    //cout<<"load ("<<count++<<"/"<<radarpolar_file_list_.size()<<") from: "<<file_path<<endl;
-    radarpolar_image = imread(file_path, 0);
-
-    size_t lastindex = file_name.find_last_of(".");
-    std::string stamp_str = file_name.substr(0, lastindex);
-    int64_t  stamp_int;
-    std::istringstream ( stamp_str ) >> stamp_int;
-
-    cv_bridge::CvImage radarpolar_out_msg;
-    radarpolar_out_msg.header.stamp.fromNSec(stamp_int);
-    radarpolar_out_msg.header.frame_id = "radar_polar";
-    radarpolar_out_msg.encoding = sensor_msgs::image_encodings::MONO8;
-    radarpolar_out_msg.image    = radarpolar_image;
-    auto msg = radarpolar_out_msg.toImageMsg();
-    bag.write("/Navtech/Polar", msg->header.stamp, *msg);
-  }
-  ////////////////////// OPEN GROUND TRUTH FILE /////////////////////
-
-  const std::string gt_csv_path = data_folder_path_+ std::string("/global_pose.csv");
-  fstream fin;
-  fin.open(gt_csv_path, ios::in);
-  if(fin.is_open()){
-    cout<<"loaded: "<<gt_csv_path<<endl;
-
-    std::string temp;
-    int count  = 0;
-    nav_msgs::Odometry Tgt_msg;
-    Tgt_msg.header.frame_id = "world";
-    while (fin >> temp) {
-      Eigen::Matrix<double,4,4> T = Eigen::Matrix<double,4,4>::Zero();
-      T(3,3) = 1.0;
-
-      std::vector<string> row;
-
-      stringstream  ss(temp);
-      std::string str;
-      while (getline(ss, str, ','))
-        row.push_back(str);
-      if(row.size()!=13)
-        break;
-      int64_t stamp_int;
-      std::istringstream ( row[0] ) >> stamp_int;
-      for(int i=0;i<3;i++){
-        for(int j=0;j<4;j++){
-          double d = boost::lexical_cast<double> (row[1+(4*i)+j]);
-          T(i,j) = d;
+        if (stamp < min_time || stamp > max_time) {
+            std::cerr << "Skipping IMU data with invalid timestamp: " << stamp_ns << std::endl;
+            continue;
         }
-      }
 
-      Eigen::Affine3d Tgt(T);
-      //std::cout<<Tgt.matrix()<<std::endl;
-      tf::poseEigenToMsg(Tgt,Tgt_msg.pose.pose);
-      Tgt_msg.header.stamp.fromNSec(stamp_int);
-      bag.write("/gt", Tgt_msg.header.stamp, Tgt_msg);
-      //cout<<"Written: "<<count++<<" /gt nav_msgs/odometry poses to /gt"<<endl;
+        const sensor_msgs::Imu& imu_msg = imu_entry.second;
+        bag.write("/imu/data_raw", stamp, imu_msg);
     }
-  }
-  cout<<"rosbag stored at: "<<bag_path<<endl;
-  bag.close();
+    std::cout << "IMU data saved." << std::endl;
+
+    // Save LiDAR (Ouster) data
+    for (const auto& ouster_file : ouster_file_list_) {
+        std::string file_path = data_folder_path_ + "/sensor_data/Ouster/" + ouster_file;
+
+        // Check if file exists and is valid
+        if (find(ouster_file_list_.begin(), ouster_file_list_.end(), ouster_file) == ouster_file_list_.end()) {
+            std::cerr << "LiDAR file not found: " << file_path << std::endl;
+            continue;
+        }
+
+        pcl::PointCloud<PointXYZIRT> cloud;
+        cloud.clear();
+        sensor_msgs::PointCloud2 publish_cloud;
+
+        std::ifstream file(file_path, std::ios::in | std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open LiDAR file: " << file_path << std::endl;
+            continue;
+        }
+
+        while (!file.eof()) {
+            PointXYZIRT point;
+            file.read(reinterpret_cast<char*>(&point.x), sizeof(float));
+            file.read(reinterpret_cast<char*>(&point.y), sizeof(float));
+            file.read(reinterpret_cast<char*>(&point.z), sizeof(float));
+            file.read(reinterpret_cast<char*>(&point.intensity), sizeof(float));
+            point.ring = 0;  // Default ring value
+            cloud.points.push_back(point);
+        }
+        file.close();
+
+        pcl::toROSMsg(cloud, publish_cloud);
+        size_t lastindex = ouster_file.find_last_of(".");
+        std::string stamp_str = ouster_file.substr(0, lastindex);
+        int64_t stamp_ns;
+        std::istringstream(stamp_str) >> stamp_ns;
+
+        ros::Time stamp = ros::Time().fromNSec(stamp_ns);
+        if (stamp < min_time || stamp > max_time) {
+            std::cerr << "Skipping LiDAR data with invalid timestamp: " << stamp_ns << std::endl;
+            continue;
+        }
+
+        publish_cloud.header.stamp = stamp;
+        publish_cloud.header.frame_id = "ouster";
+
+        bag.write("/os1_points", stamp, publish_cloud);
+    }
+    std::cout << "LiDAR data saved." << std::endl;
+
+    bag.close();
+    std::cout << "Bag file saved at: " << bag_path << std::endl;
 }
+
+// End of file
